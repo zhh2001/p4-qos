@@ -123,15 +123,15 @@ var classifierRules = []classifierRule{
 var classMeters = []classMeterConfig{
 	{
 		classID: classHigh,
-		config:  meter.Config{CIR: 10000, CBurst: 100, PIR: 20000, PBurst: 200},
+		config:  meter.Config{CIR: 5, CBurst: 2, PIR: 10, PBurst: 4},
 	},
 	{
 		classID: classNormal,
-		config:  meter.Config{CIR: 10000, CBurst: 100, PIR: 20000, PBurst: 200},
+		config:  meter.Config{CIR: 5, CBurst: 2, PIR: 10, PBurst: 4},
 	},
 	{
 		classID: classScavenger,
-		config:  meter.Config{CIR: 10000, CBurst: 100, PIR: 20000, PBurst: 200},
+		config:  meter.Config{CIR: 5, CBurst: 2, PIR: 10, PBurst: 4},
 	},
 }
 

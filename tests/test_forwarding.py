@@ -28,17 +28,30 @@ DEVICE_CONFIG = ROOT / "build" / "qos.json"
 PACKET_OUTGOING = 4
 ETH_P_ALL = 0x0003
 CAPTURE_SECONDS = 0.35
+METER_CIR = 5
+METER_COMMITTED_BURST = 2
+METER_PIR = 10
+METER_PEAK_BURST = 4
+METER_REFILL_SECONDS = (
+    max(
+        METER_COMMITTED_BURST / METER_CIR,
+        METER_PEAK_BURST / METER_PIR,
+    )
+    + 0.1
+)
+METER_BURST_PACKETS = 8
 
-SEND_FRAME = """
+SEND_FRAMES = """
 import socket
 import sys
 
-frame = bytes.fromhex(sys.argv[2])
+frames = [bytes.fromhex(value) for value in sys.argv[2:]]
 with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as sender:
     sender.bind((sys.argv[1], 0))
-    written = sender.send(frame)
-if written != len(frame):
-    raise SystemExit(f"sent {written} of {len(frame)} bytes")
+    for frame in frames:
+        written = sender.send(frame)
+        if written != len(frame):
+            raise SystemExit(f"sent {written} of {len(frame)} bytes")
 """
 
 
@@ -68,6 +81,39 @@ def serialized(packet):
     return Ether(bytes(packet))
 
 
+def meter_packet(qos_class, token, sequence):
+    if qos_class == "HIGH":
+        source = "h1"
+        transport = TCP(
+            sport=40000 + sequence,
+            dport=443,
+            seq=0x71000000 + sequence,
+            ack=0x72000000 + sequence,
+            flags="PA",
+        )
+        ip_source = "10.0.1.1"
+    elif qos_class == "NORMAL":
+        source = "h2"
+        transport = UDP(sport=40000 + sequence, dport=5000)
+        ip_source = "10.0.2.1"
+    else:
+        raise ValueError(f"unsupported metered class {qos_class!r}")
+
+    packet = (
+        Ether(src=HOSTS[source]["mac"], dst=HOSTS[source]["gateway_mac"])
+        / IP(
+            src=ip_source,
+            dst="10.0.3.200",
+            ttl=64,
+            id=0x6000 + sequence,
+            tos=(31 << 2) | (sequence % 4),
+        )
+        / transport
+        / Raw(token)
+    )
+    return source, serialized(packet)
+
+
 def open_captures():
     captures = {}
     try:
@@ -85,9 +131,12 @@ def open_captures():
     return captures
 
 
-def send_from(host, interface, frame):
+def send_frames(host, interface, frames):
+    if not frames:
+        raise ValueError("at least one frame is required")
     sender = host.popen(
-        [sys.executable, "-c", SEND_FRAME, interface, frame.hex()],
+        [sys.executable, "-c", SEND_FRAMES, interface]
+        + [frame.hex() for frame in frames],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -110,11 +159,15 @@ def send_from(host, interface, frame):
         )
 
 
-def capture_token(lab, source, frame, token):
+def capture_batches(lab, batches, tokens):
+    tokens = tuple(tokens)
+    if not tokens:
+        raise ValueError("at least one token is required")
     captures = open_captures()
     observed = {port: [] for port in captures}
     try:
-        send_from(lab.net.get(source), f"{source}-eth0", frame)
+        for source, frames in batches:
+            send_frames(lab.net.get(source), f"{source}-eth0", frames)
         deadline = time.monotonic() + CAPTURE_SECONDS
         while True:
             remaining = deadline - time.monotonic()
@@ -129,7 +182,9 @@ def capture_token(lab, source, frame, token):
                         packet, address = capture.recvfrom(65535)
                     except BlockingIOError:
                         break
-                    if address[2] != PACKET_OUTGOING or token not in packet:
+                    if address[2] != PACKET_OUTGOING or not any(
+                        token in packet for token in tokens
+                    ):
                         continue
                     port = next(
                         number
@@ -141,6 +196,10 @@ def capture_token(lab, source, frame, token):
         for capture in captures.values():
             capture.close()
     return observed
+
+
+def capture_token(lab, source, frame, token):
+    return capture_batches(lab, ((source, (frame,)),), (token,))
 
 
 def observations_text(observed):
@@ -160,6 +219,17 @@ def data_observations(observed):
                 continue
             data[port].append(packet)
     return data
+
+
+def data_observations_by_token(observed, tokens):
+    tokens = tuple(tokens)
+    by_token = {token: {port: [] for port in observed} for token in tokens}
+    for port, packets in data_observations(observed).items():
+        for packet in packets:
+            for token in tokens:
+                if token in packet:
+                    by_token[token][port].append(packet)
+    return by_token
 
 
 def lab_cleanup_errors(lab, node_pids):
@@ -254,6 +324,31 @@ class ForwardingIntegrationTest(unittest.TestCase):
             f"{observations_text(observed)}",
         )
         received = Ether(data[expected_port][0])
+        self.assert_packet_integrity(
+            sent,
+            received,
+            token,
+            expected_port,
+            qos_class,
+            "GREEN",
+            expected_dscp,
+        )
+
+    def assert_packet_integrity(
+        self,
+        sent,
+        received,
+        token,
+        expected_port,
+        qos_class,
+        color,
+        expected_dscp,
+    ):
+        expected_ecn = sent[IP].tos & 0x03
+        context = (
+            f"token {token!r}, class {qos_class}, expected {color} DSCP "
+            f"{expected_dscp}, expected ECN {expected_ecn}"
+        )
         destination = HOSTS[f"h{expected_port}"]
 
         self.assertEqual(received.src, destination["gateway_mac"], context)
@@ -347,6 +442,119 @@ class ForwardingIntegrationTest(unittest.TestCase):
                     0,
                     f"{context}: UDP checksum is invalid",
                 )
+
+    def build_meter_frames(self, qos_class, label, sequence_base, count):
+        source = None
+        sent = {}
+        frames = []
+        for offset in range(count):
+            token = f"qos-meter-{label}-{offset:02d}".encode()
+            packet_source, packet = meter_packet(
+                qos_class,
+                token,
+                sequence_base + offset,
+            )
+            if source is None:
+                source = packet_source
+            self.assertEqual(packet_source, source)
+            sent[token] = packet
+            frames.append(bytes(packet))
+        return source, sent, frames
+
+    def assert_meter_accounting(
+        self,
+        qos_class,
+        sent,
+        observed,
+        green_dscp,
+        yellow_dscp,
+    ):
+        by_token = data_observations_by_token(observed, sent)
+        colors = {"GREEN": set(), "YELLOW": set(), "RED": set()}
+        for token, sent_packet in sent.items():
+            outputs = [
+                (port, packet)
+                for port, packets in by_token[token].items()
+                for packet in packets
+            ]
+            if not outputs:
+                colors["RED"].add(token)
+                continue
+            self.assertEqual(
+                len(outputs),
+                1,
+                f"token {token!r}, class {qos_class}: observed {len(outputs)} "
+                f"outputs; {observations_text(by_token[token])}",
+            )
+            port, frame = outputs[0]
+            self.assertEqual(
+                port,
+                3,
+                f"token {token!r}, class {qos_class}: observed egress {port}, want 3",
+            )
+            received = Ether(frame)
+            self.assertTrue(
+                received.haslayer(IP),
+                f"token {token!r}, class {qos_class}: output is not IPv4",
+            )
+            observed_dscp = received[IP].tos >> 2
+            if observed_dscp == green_dscp:
+                color = "GREEN"
+            elif observed_dscp == yellow_dscp:
+                color = "YELLOW"
+            else:
+                self.fail(
+                    f"token {token!r}, class {qos_class}: observed DSCP "
+                    f"{observed_dscp}, want GREEN {green_dscp} or "
+                    f"YELLOW {yellow_dscp}"
+                )
+            colors[color].add(token)
+            self.assert_packet_integrity(
+                sent_packet,
+                received,
+                token,
+                3,
+                qos_class,
+                color,
+                observed_dscp,
+            )
+
+        accounted = set().union(*colors.values())
+        self.assertEqual(
+            accounted,
+            set(sent),
+            f"class {qos_class}: sent and accounted token sets differ",
+        )
+        self.assertEqual(
+            sum(len(tokens) for tokens in colors.values()),
+            len(sent),
+            f"class {qos_class}: color counts do not equal sent count",
+        )
+        return colors
+
+    def run_meter_burst(self, qos_class, label, sequence_base):
+        source, sent, frames = self.build_meter_frames(
+            qos_class,
+            label,
+            sequence_base,
+            METER_BURST_PACKETS,
+        )
+        observed = capture_batches(
+            self.lab,
+            ((source, frames),),
+            sent,
+        )
+        if qos_class == "HIGH":
+            green_dscp, yellow_dscp = 46, 10
+        else:
+            green_dscp, yellow_dscp = 0, 8
+        return self.assert_meter_accounting(
+            qos_class,
+            sent,
+            observed,
+            green_dscp,
+            yellow_dscp,
+        )
 
     def test_topology_configuration(self):
         port_map = {
@@ -496,6 +704,118 @@ class ForwardingIntegrationTest(unittest.TestCase):
                     "NORMAL (classifier miss)",
                     0,
                 )
+
+    def test_meter_color_accounting_is_stable(self):
+        expected_counts = {"GREEN": 2, "YELLOW": 2, "RED": 4}
+        for run in range(3):
+            with self.subTest(qos_class="HIGH", run=run):
+                time.sleep(METER_REFILL_SECONDS)
+                colors = self.run_meter_burst(
+                    "HIGH",
+                    f"high-stability-{run}",
+                    100 + run * METER_BURST_PACKETS,
+                )
+                self.assertEqual(
+                    {color: len(tokens) for color, tokens in colors.items()},
+                    expected_counts,
+                    f"HIGH run {run} color distribution changed",
+                )
+
+        time.sleep(METER_REFILL_SECONDS)
+        colors = self.run_meter_burst("NORMAL", "normal-colors", 200)
+        self.assertEqual(
+            {color: len(tokens) for color, tokens in colors.items()},
+            expected_counts,
+            "NORMAL color distribution changed",
+        )
+
+    def test_meter_independent_class_state(self):
+        time.sleep(METER_REFILL_SECONDS)
+        high_source, high_sent, high_frames = self.build_meter_frames(
+            "HIGH",
+            "independent-high",
+            300,
+            METER_BURST_PACKETS,
+        )
+        normal_token = b"qos-meter-independent-normal"
+        normal_source, normal_packet = meter_packet("NORMAL", normal_token, 320)
+        observed = capture_batches(
+            self.lab,
+            (
+                (high_source, high_frames),
+                (normal_source, (bytes(normal_packet),)),
+            ),
+            (*high_sent, normal_token),
+        )
+        high_colors = self.assert_meter_accounting(
+            "HIGH",
+            high_sent,
+            observed,
+            46,
+            10,
+        )
+        self.assertTrue(high_colors["RED"], "HIGH burst did not exhaust its meter")
+        normal_colors = self.assert_meter_accounting(
+            "NORMAL",
+            {normal_token: normal_packet},
+            observed,
+            0,
+            8,
+        )
+        self.assertEqual(
+            normal_colors["GREEN"],
+            {normal_token},
+            f"NORMAL did not remain GREEN after HIGH exhaustion: {normal_colors}",
+        )
+
+        time.sleep(METER_REFILL_SECONDS)
+        normal_source, normal_sent, normal_frames = self.build_meter_frames(
+            "NORMAL",
+            "independent-normal-burst",
+            330,
+            METER_BURST_PACKETS,
+        )
+        high_token = b"qos-meter-independent-high"
+        high_source, high_packet = meter_packet("HIGH", high_token, 350)
+        observed = capture_batches(
+            self.lab,
+            (
+                (normal_source, normal_frames),
+                (high_source, (bytes(high_packet),)),
+            ),
+            (*normal_sent, high_token),
+        )
+        normal_colors = self.assert_meter_accounting(
+            "NORMAL",
+            normal_sent,
+            observed,
+            0,
+            8,
+        )
+        self.assertTrue(normal_colors["RED"], "NORMAL burst did not exhaust its meter")
+        high_colors = self.assert_meter_accounting(
+            "HIGH",
+            {high_token: high_packet},
+            observed,
+            46,
+            10,
+        )
+        self.assertEqual(
+            high_colors["GREEN"],
+            {high_token},
+            f"HIGH did not remain GREEN after NORMAL exhaustion: {high_colors}",
+        )
+
+    def test_meter_refill_restores_green(self):
+        time.sleep(METER_REFILL_SECONDS)
+        colors = self.run_meter_burst("HIGH", "refill-burst", 400)
+        self.assertTrue(colors["YELLOW"], "refill burst produced no YELLOW packets")
+        self.assertTrue(colors["RED"], "refill burst produced no RED packets")
+
+        time.sleep(METER_REFILL_SECONDS)
+        token = b"qos-meter-refill-green"
+        _, packet = meter_packet("HIGH", token, 420)
+        self.assert_forwarded("h1", packet, token, 3, "HIGH", 46)
 
     def test_reverse_h3_to_h1(self):
         token = b"qos-forward-rev-003"

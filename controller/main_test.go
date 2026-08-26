@@ -285,10 +285,10 @@ func TestClassMeterConfiguration(t *testing.T) {
 		classScavenger: true,
 	}
 	wantConfig := meter.Config{
-		CIR:    10000,
-		CBurst: 100,
-		PIR:    20000,
-		PBurst: 200,
+		CIR:    5,
+		CBurst: 2,
+		PIR:    10,
+		PBurst: 4,
 	}
 	if len(classMeters) != len(wantClasses) {
 		t.Fatalf("configured %d class meters, want %d", len(classMeters), len(wantClasses))
