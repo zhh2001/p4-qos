@@ -943,6 +943,24 @@ class ForwardingIntegrationTest(unittest.TestCase):
                     f"IPv4 TTL {ttl}",
                 )
 
+    def test_udp_zero_checksum_is_preserved(self):
+        token = b"qos-normal-udp-zero-checksum"
+        packet = (
+            Ether(src=HOSTS["h2"]["mac"], dst=HOSTS["h2"]["gateway_mac"])
+            / IP(
+                src="10.0.2.1",
+                dst="10.0.3.1",
+                ttl=58,
+                id=0x5201,
+                tos=(29 << 2) | 3,
+            )
+            / UDP(sport=52001, dport=5000, chksum=0)
+            / Raw(token)
+        )
+        sent = serialized(packet)
+        self.assertEqual(sent[UDP].chksum, 0)
+        self.assert_forwarded("h2", sent, token, 3, "NORMAL", 0)
+
     def test_meter_color_accounting_is_stable(self):
         expected_counts = {"GREEN": 2, "YELLOW": 2, "RED": 4}
         for run in range(3):
