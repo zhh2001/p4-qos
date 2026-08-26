@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from scapy.all import ICMP, Ether, IP, Raw, TCP, UDP
+from scapy.all import ICMP, Ether, IP, IPOption, Raw, TCP, UDP
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +27,8 @@ P4INFO = ROOT / "build" / "qos.p4info.txtpb"
 DEVICE_CONFIG = ROOT / "build" / "qos.json"
 PACKET_OUTGOING = 4
 ETH_P_ALL = 0x0003
+ETHERNET_HEADER_LENGTH = 14
+IPV4_HEADER_LENGTH = 20
 CAPTURE_SECONDS = 0.35
 METER_CIR = 5
 METER_COMMITTED_BURST = 2
@@ -79,6 +81,18 @@ def transport_checksum(ip_packet):
 
 def serialized(packet):
     return Ether(bytes(packet))
+
+
+def with_ipv4_total_length(frame, total_length):
+    result = bytearray(frame)
+    struct.pack_into("!H", result, ETHERNET_HEADER_LENGTH + 2, total_length)
+    checksum_offset = ETHERNET_HEADER_LENGTH + 10
+    struct.pack_into("!H", result, checksum_offset, 0)
+    header = bytes(
+        result[ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH]
+    )
+    struct.pack_into("!H", result, checksum_offset, checksum(header))
+    return bytes(result)
 
 
 def meter_packet(qos_class, token, sequence):
@@ -332,6 +346,18 @@ class ForwardingIntegrationTest(unittest.TestCase):
             qos_class,
             "GREEN",
             expected_dscp,
+        )
+
+    def assert_dropped(self, source, frame, token, reason):
+        # A full meter prevents policing from masking the validation result.
+        time.sleep(METER_REFILL_SECONDS)
+        observed = capture_token(self.lab, source, bytes(frame), token)
+        count = sum(len(packets) for packets in observed.values())
+        self.assertEqual(
+            count,
+            0,
+            f"token {token!r}, {reason}: expected DROP, observed {count} "
+            f"outputs; {observations_text(observed)}",
         )
 
     def assert_packet_integrity(
@@ -705,6 +731,218 @@ class ForwardingIntegrationTest(unittest.TestCase):
                     0,
                 )
 
+    def test_bad_ipv4_checksum_drops(self):
+        token = b"qos-bad-ipv4-checksum-001"
+        packet = (
+            Ether(src=HOSTS["h1"]["mac"], dst=HOSTS["h1"]["gateway_mac"])
+            / IP(src="10.0.1.1", dst="10.0.3.200", ttl=64, id=0x5101)
+            / UDP(sport=51001, dport=5001)
+            / Raw(token)
+        )
+        frame = bytearray(bytes(serialized(packet)))
+        header = slice(
+            ETHERNET_HEADER_LENGTH,
+            ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH,
+        )
+        self.assertEqual(checksum(bytes(frame[header])), 0)
+        frame[ETHERNET_HEADER_LENGTH + 10] ^= 0x01
+        self.assertNotEqual(checksum(bytes(frame[header])), 0)
+        self.assert_dropped("h1", frame, token, "bad IPv4 checksum")
+
+    def test_ipv4_fragments_drop(self):
+        cases = (
+            ("MF first fragment", "MF", 0, b"qos-ipv4-mf-fragment-001"),
+            ("non-first fragment", 0, 3, b"qos-ipv4-offset-fragment-003"),
+        )
+        for reason, flags, offset, token in cases:
+            with self.subTest(reason=reason):
+                packet = (
+                    Ether(
+                        src=HOSTS["h1"]["mac"],
+                        dst=HOSTS["h1"]["gateway_mac"],
+                    )
+                    / IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.200",
+                        ttl=64,
+                        id=0x5102 + offset,
+                        flags=flags,
+                        frag=offset,
+                    )
+                    / UDP(sport=51002 + offset, dport=5001)
+                    / Raw(token)
+                )
+                frame = bytes(serialized(packet))
+                flags_offset = struct.unpack_from(
+                    "!H",
+                    frame,
+                    ETHERNET_HEADER_LENGTH + 6,
+                )[0]
+                self.assertEqual(bool(flags_offset & 0x2000), flags == "MF")
+                self.assertEqual(flags_offset & 0x1FFF, offset)
+                self.assert_dropped("h1", frame, token, reason)
+
+    def test_ipv4_options_drop(self):
+        token = b"qos-ipv4-options-001"
+        packet = (
+            Ether(src=HOSTS["h1"]["mac"], dst=HOSTS["h1"]["gateway_mac"])
+            / IP(
+                src="10.0.1.1",
+                dst="10.0.3.200",
+                ttl=64,
+                id=0x5103,
+                options=[IPOption(b"\x00\x00\x00\x00")],
+            )
+            / ICMP(type=8, id=0x5103)
+            / Raw(token)
+        )
+        frame = bytes(packet)
+        header_length = (frame[ETHERNET_HEADER_LENGTH] & 0x0F) * 4
+        self.assertEqual(header_length, 24)
+        self.assertEqual(
+            checksum(
+                frame[ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH + header_length]
+            ),
+            0,
+        )
+        self.assertEqual(
+            checksum(
+                frame[
+                    ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH
+                ]
+            ),
+            0,
+        )
+        self.assert_dropped("h1", frame, token, "IPv4 options")
+
+    def test_ipv4_version_mismatch_drops(self):
+        token = b"qos-ipv4-version-6-drop"
+        packet = (
+            Ether(src=HOSTS["h1"]["mac"], dst=HOSTS["h1"]["gateway_mac"])
+            / IP(src="10.0.1.1", dst="10.0.3.200", ttl=64, id=0x5106)
+            / UDP(sport=51006, dport=5001)
+            / Raw(token)
+        )
+        frame = bytearray(bytes(serialized(packet)))
+        frame[ETHERNET_HEADER_LENGTH] = (6 << 4) | (
+            frame[ETHERNET_HEADER_LENGTH] & 0x0F
+        )
+        checksum_offset = ETHERNET_HEADER_LENGTH + 10
+        struct.pack_into("!H", frame, checksum_offset, 0)
+        header = bytes(
+            frame[ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH]
+        )
+        struct.pack_into("!H", frame, checksum_offset, checksum(header))
+        self.assertEqual(frame[ETHERNET_HEADER_LENGTH] >> 4, 6)
+        self.assertEqual(
+            checksum(
+                bytes(
+                    frame[
+                        ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH
+                        + IPV4_HEADER_LENGTH
+                    ]
+                )
+            ),
+            0,
+        )
+        self.assert_dropped("h1", frame, token, "IPv4 version mismatch")
+
+    def test_malformed_ipv4_lengths_drop(self):
+        too_small_token = b"qos-ipv4-length-too-small-001"
+        too_small_packet = (
+            Ether(src=HOSTS["h1"]["mac"], dst=HOSTS["h1"]["gateway_mac"])
+            / IP(src="10.0.1.1", dst="10.0.3.200", ttl=64, id=0x5104)
+            / UDP(sport=51004, dport=5001)
+            / Raw(too_small_token)
+        )
+        too_small = with_ipv4_total_length(
+            bytes(serialized(too_small_packet)),
+            IPV4_HEADER_LENGTH - 1,
+        )
+        self.assertEqual(
+            struct.unpack_from("!H", too_small, ETHERNET_HEADER_LENGTH + 2)[0],
+            IPV4_HEADER_LENGTH - 1,
+        )
+        self.assertEqual(
+            checksum(
+                too_small[
+                    ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH
+                ]
+            ),
+            0,
+        )
+        self.assert_dropped(
+            "h1",
+            too_small,
+            too_small_token,
+            "IPv4 total length below the base header",
+        )
+
+        too_large_token = b"qos-ipv4-length-too-large-001"
+        too_large_packet = (
+            Ether(src=HOSTS["h1"]["mac"], dst=HOSTS["h1"]["gateway_mac"])
+            / IP(src="10.0.1.1", dst="10.0.3.200", ttl=64, id=0x5105)
+            / ICMP(type=8, id=0x5105)
+            / Raw(too_large_token)
+        )
+        frame = bytes(too_large_packet)
+        claimed_length = len(frame) - ETHERNET_HEADER_LENGTH + 64
+        too_large = with_ipv4_total_length(frame, claimed_length)
+        self.assertLess(
+            len(too_large),
+            ETHERNET_HEADER_LENGTH + claimed_length,
+        )
+        self.assertEqual(
+            checksum(
+                too_large[
+                    ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH
+                ]
+            ),
+            0,
+        )
+        self.assert_dropped(
+            "h1",
+            too_large,
+            too_large_token,
+            "IPv4 total length exceeds the received frame",
+        )
+
+    def test_ttl_exhaustion_drops(self):
+        for ttl in (1, 0):
+            token = f"qos-ipv4-ttl-{ttl}-drop".encode()
+            with self.subTest(ttl=ttl):
+                packet = (
+                    Ether(
+                        src=HOSTS["h1"]["mac"],
+                        dst=HOSTS["h1"]["gateway_mac"],
+                    )
+                    / IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.200",
+                        ttl=ttl,
+                        id=0x5110 + ttl,
+                    )
+                    / UDP(sport=51100 + ttl, dport=5001)
+                    / Raw(token)
+                )
+                frame = bytes(serialized(packet))
+                self.assertEqual(frame[ETHERNET_HEADER_LENGTH + 8], ttl)
+                self.assertEqual(
+                    checksum(
+                        frame[
+                            ETHERNET_HEADER_LENGTH : ETHERNET_HEADER_LENGTH
+                            + IPV4_HEADER_LENGTH
+                        ]
+                    ),
+                    0,
+                )
+                self.assert_dropped(
+                    "h1",
+                    frame,
+                    token,
+                    f"IPv4 TTL {ttl}",
+                )
+
     def test_meter_color_accounting_is_stable(self):
         expected_counts = {"GREEN": 2, "YELLOW": 2, "RED": 4}
         for run in range(3):
@@ -845,14 +1083,11 @@ class ForwardingIntegrationTest(unittest.TestCase):
             / UDP(sport=44004, dport=9000)
             / Raw(token)
         )
-        sent = bytes(serialized(packet))
-        observed = capture_token(self.lab, "h1", sent, token)
-        data = data_observations(observed)
-        count = sum(len(packets) for packets in data.values())
-        self.assertEqual(
-            count,
-            0,
-            f"route-miss token {token!r} was forwarded; {observations_text(observed)}",
+        self.assert_dropped(
+            "h1",
+            bytes(serialized(packet)),
+            token,
+            "IPv4 route miss",
         )
         self.lab.program(CONTROLLER, P4INFO, DEVICE_CONFIG, verify_only=True)
 
