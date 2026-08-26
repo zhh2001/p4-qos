@@ -7,10 +7,13 @@ import (
 
 	p4v1 "github.com/p4lang/p4runtime/go/p4/v1"
 	"github.com/zhh2001/p4runtime-go-controller/codec"
+	"github.com/zhh2001/p4runtime-go-controller/meter"
+	"github.com/zhh2001/p4runtime-go-controller/pipeline"
 	"google.golang.org/protobuf/proto"
 )
 
-func TestBuildRouteEntries(t *testing.T) {
+func loadTestPipeline(t *testing.T) *pipeline.Pipeline {
+	t.Helper()
 	p, err := loadPipeline(
 		filepath.Join("..", "build", "qos.p4info.txtpb"),
 		filepath.Join("..", "build", "qos.json"),
@@ -18,6 +21,11 @@ func TestBuildRouteEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return p
+}
+
+func TestBuildRouteEntries(t *testing.T) {
+	p := loadTestPipeline(t)
 	entries, err := buildRouteEntries(p)
 	if err != nil {
 		t.Fatal(err)
@@ -97,14 +105,218 @@ func TestBuildRouteEntries(t *testing.T) {
 	}
 }
 
-func TestCompareTableEntriesIgnoresWireOrder(t *testing.T) {
-	p, err := loadPipeline(
-		filepath.Join("..", "build", "qos.p4info.txtpb"),
-		filepath.Join("..", "build", "qos.json"),
-	)
+func TestBuildClassifierEntries(t *testing.T) {
+	p := loadTestPipeline(t)
+	entries, err := buildClassifierEntries(p)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(entries) != len(classifierRules) {
+		t.Fatalf("built %d classifiers, want %d", len(entries), len(classifierRules))
+	}
+
+	table, ok := p.Table(classifierTableName)
+	if !ok {
+		t.Fatalf("missing table %q", classifierTableName)
+	}
+	action, ok := p.Action("set_qos_class")
+	if !ok {
+		t.Fatal("missing action set_qos_class")
+	}
+	classParameter, ok := action.Param("class_id")
+	if !ok {
+		t.Fatal("action set_qos_class has no class_id parameter")
+	}
+
+	prefixMask, err := codec.TernaryMask(24, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, entry := range entries {
+		configured := classifierRules[index]
+		if entry.GetTableId() != table.ID {
+			t.Errorf(
+				"classifier %s table ID is %d, want %d",
+				configured.name,
+				entry.GetTableId(),
+				table.ID,
+			)
+		}
+		if entry.GetPriority() != configured.priority {
+			t.Errorf(
+				"classifier %s priority is %d, want %d",
+				configured.name,
+				entry.GetPriority(),
+				configured.priority,
+			)
+		}
+
+		wantMatchCount := 4
+		if configured.matchDestinationPort {
+			wantMatchCount++
+		}
+		if len(entry.GetMatch()) != wantMatchCount {
+			t.Fatalf(
+				"classifier %s has %d matches, want %d",
+				configured.name,
+				len(entry.GetMatch()),
+				wantMatchCount,
+			)
+		}
+		matches := make(map[uint32]*p4v1.FieldMatch, len(entry.GetMatch()))
+		for _, match := range entry.GetMatch() {
+			if matches[match.GetFieldId()] != nil {
+				t.Fatalf("classifier %s repeats field ID %d", configured.name, match.GetFieldId())
+			}
+			matches[match.GetFieldId()] = match
+		}
+		assertTernary := func(field string, value, mask []byte) {
+			t.Helper()
+			definition, ok := table.MatchField(field)
+			if !ok {
+				t.Fatalf("table %s has no field %q", classifierTableName, field)
+			}
+			match := matches[definition.ID]
+			if match == nil {
+				t.Fatalf("classifier %s has no match for %s", configured.name, field)
+			}
+			if !bytes.Equal(match.GetTernary().GetValue(), value) ||
+				!bytes.Equal(match.GetTernary().GetMask(), mask) {
+				t.Errorf(
+					"classifier %s match %s is %x/%x, want %x/%x",
+					configured.name,
+					field,
+					match.GetTernary().GetValue(),
+					match.GetTernary().GetMask(),
+					value,
+					mask,
+				)
+			}
+		}
+		assertTernary(
+			"standard_metadata.ingress_port",
+			codec.MustEncodeUint(configured.ingressPort, 9),
+			codec.MustEncodeUint(0x1ff, 9),
+		)
+		assertTernary(
+			"hdr.ipv4.srcAddr",
+			codec.MustIPv4(configured.sourcePrefix),
+			prefixMask,
+		)
+		assertTernary(
+			"hdr.ipv4.dstAddr",
+			codec.MustIPv4(configured.destinationPrefix),
+			prefixMask,
+		)
+		assertTernary(
+			"hdr.ipv4.protocol",
+			codec.MustEncodeUint(configured.protocol, 8),
+			codec.MustEncodeUint(0xff, 8),
+		)
+		if configured.matchDestinationPort {
+			assertTernary(
+				"meta.l4DstPort",
+				codec.MustEncodeUint(configured.destinationPort, 16),
+				codec.MustEncodeUint(0xffff, 16),
+			)
+		}
+
+		gotAction := entry.GetAction().GetAction()
+		if gotAction == nil || gotAction.GetActionId() != action.ID {
+			t.Fatalf("classifier %s has unexpected action %v", configured.name, gotAction)
+		}
+		if len(gotAction.GetParams()) != 1 ||
+			gotAction.GetParams()[0].GetParamId() != classParameter.ID ||
+			!bytes.Equal(
+				gotAction.GetParams()[0].GetValue(),
+				codec.MustEncodeUint(configured.classID, 8),
+			) {
+			t.Errorf("classifier %s has unexpected class action %v", configured.name, gotAction)
+		}
+	}
+}
+
+func TestBuildClassifierDefault(t *testing.T) {
+	p := loadTestPipeline(t)
+	entry, err := buildClassifierDefault(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table, ok := p.Table(classifierTableName)
+	if !ok {
+		t.Fatalf("missing table %q", classifierTableName)
+	}
+	action, ok := p.Action("set_qos_class")
+	if !ok {
+		t.Fatal("missing action set_qos_class")
+	}
+	classParameter, ok := action.Param("class_id")
+	if !ok {
+		t.Fatal("action set_qos_class has no class_id parameter")
+	}
+
+	if entry.GetTableId() != table.ID || !entry.GetIsDefaultAction() {
+		t.Fatalf("unexpected classifier default identity %v", entry)
+	}
+	if len(entry.GetMatch()) != 0 || entry.GetPriority() != 0 {
+		t.Errorf("classifier default has matches or priority: %v", entry)
+	}
+	gotAction := entry.GetAction().GetAction()
+	if gotAction == nil || gotAction.GetActionId() != action.ID ||
+		len(gotAction.GetParams()) != 1 ||
+		gotAction.GetParams()[0].GetParamId() != classParameter.ID ||
+		!bytes.Equal(
+			gotAction.GetParams()[0].GetValue(),
+			codec.MustEncodeUint(classNormal, 8),
+		) {
+		t.Errorf("unexpected classifier default action %v", gotAction)
+	}
+}
+
+func TestClassMeterConfiguration(t *testing.T) {
+	p := loadTestPipeline(t)
+	definition, ok := p.Meter(classMeterName)
+	if !ok {
+		t.Fatalf("missing meter %q", classMeterName)
+	}
+	wantClasses := map[int64]bool{
+		classHigh:      true,
+		classNormal:    true,
+		classScavenger: true,
+	}
+	wantConfig := meter.Config{
+		CIR:    10000,
+		CBurst: 100,
+		PIR:    20000,
+		PBurst: 200,
+	}
+	if len(classMeters) != len(wantClasses) {
+		t.Fatalf("configured %d class meters, want %d", len(classMeters), len(wantClasses))
+	}
+	for _, configured := range classMeters {
+		if !wantClasses[configured.classID] {
+			t.Errorf("unexpected or duplicate class meter index %d", configured.classID)
+		}
+		delete(wantClasses, configured.classID)
+		if configured.classID < 0 || configured.classID >= definition.Size {
+			t.Errorf("class meter index %d is outside size %d", configured.classID, definition.Size)
+		}
+		if configured.config != wantConfig {
+			t.Errorf(
+				"class %d meter configuration is %+v, want %+v",
+				configured.classID,
+				configured.config,
+				wantConfig,
+			)
+		}
+	}
+	if len(wantClasses) != 0 {
+		t.Errorf("missing class meter indexes %v", wantClasses)
+	}
+}
+
+func TestCompareTableEntriesIgnoresWireOrder(t *testing.T) {
+	p := loadTestPipeline(t)
 	want, err := buildRouteEntries(p)
 	if err != nil {
 		t.Fatal(err)

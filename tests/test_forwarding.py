@@ -223,39 +223,130 @@ class ForwardingIntegrationTest(unittest.TestCase):
         if errors:
             raise AssertionError("; ".join(errors))
 
-    def assert_forwarded(self, source, packet, token, expected_port):
+    def assert_forwarded(
+        self,
+        source,
+        packet,
+        token,
+        expected_port,
+        qos_class,
+        expected_dscp,
+    ):
         sent = serialized(packet)
         observed = capture_token(self.lab, source, bytes(sent), token)
         data = data_observations(observed)
         count = sum(len(packets) for packets in data.values())
+        expected_ecn = sent[IP].tos & 0x03
+        context = (
+            f"token {token!r}, class {qos_class}, expected GREEN DSCP "
+            f"{expected_dscp}, expected ECN {expected_ecn}"
+        )
         self.assertEqual(
             count,
             1,
-            f"token {token!r} produced {count} egress packets; "
+            f"{context}: produced {count} egress packets; "
             f"{observations_text(observed)}",
         )
         self.assertEqual(
             len(data[expected_port]),
             1,
-            f"token {token!r} did not use port {expected_port}; "
+            f"{context}: did not use port {expected_port}; "
             f"{observations_text(observed)}",
         )
         received = Ether(data[expected_port][0])
         destination = HOSTS[f"h{expected_port}"]
 
-        self.assertEqual(received.src, destination["gateway_mac"])
-        self.assertEqual(received.dst, destination["mac"])
-        self.assertEqual(received[IP].src, sent[IP].src)
-        self.assertEqual(received[IP].dst, sent[IP].dst)
-        self.assertEqual(received[IP].id, sent[IP].id)
-        self.assertEqual(received[IP].version, sent[IP].version)
-        self.assertEqual(received[IP].ihl, sent[IP].ihl)
-        self.assertEqual(received[IP].len, sent[IP].len)
-        self.assertEqual(received[IP].proto, sent[IP].proto)
-        self.assertEqual(received[IP].ttl, sent[IP].ttl - 1)
+        self.assertEqual(received.src, destination["gateway_mac"], context)
+        self.assertEqual(received.dst, destination["mac"], context)
+        self.assertTrue(received.haslayer(IP), f"{context}: output is not IPv4")
+        for field in (
+            "src",
+            "dst",
+            "id",
+            "version",
+            "ihl",
+            "len",
+            "proto",
+            "flags",
+            "frag",
+            "options",
+        ):
+            self.assertEqual(
+                getattr(received[IP], field),
+                getattr(sent[IP], field),
+                f"{context}: IPv4 {field} changed",
+            )
+        self.assertEqual(
+            received[IP].tos >> 2,
+            expected_dscp,
+            f"{context}: observed DSCP {received[IP].tos >> 2}",
+        )
+        self.assertEqual(
+            received[IP].tos & 0x03,
+            expected_ecn,
+            f"{context}: observed ECN {received[IP].tos & 0x03}",
+        )
+        self.assertEqual(
+            received[IP].ttl,
+            sent[IP].ttl - 1,
+            f"{context}: TTL was not decremented exactly once",
+        )
         ip_header = bytes(received[IP])[: received[IP].ihl * 4]
-        self.assertEqual(checksum(ip_header), 0, "forwarded IPv4 checksum is invalid")
-        return sent, received
+        self.assertEqual(
+            checksum(ip_header),
+            0,
+            f"{context}: forwarded IPv4 checksum is invalid",
+        )
+
+        if sent.haslayer(TCP):
+            self.assertTrue(received.haslayer(TCP), f"{context}: TCP header is absent")
+            for field in (
+                "sport",
+                "dport",
+                "seq",
+                "ack",
+                "dataofs",
+                "reserved",
+                "flags",
+                "window",
+                "chksum",
+                "urgptr",
+                "options",
+            ):
+                self.assertEqual(
+                    getattr(received[TCP], field),
+                    getattr(sent[TCP], field),
+                    f"{context}: TCP {field} changed",
+                )
+            self.assertEqual(
+                bytes(received[TCP].payload),
+                bytes(sent[TCP].payload),
+                f"{context}: TCP payload changed",
+            )
+            self.assertEqual(
+                transport_checksum(received[IP]),
+                0,
+                f"{context}: TCP checksum is invalid",
+            )
+        elif sent.haslayer(UDP):
+            self.assertTrue(received.haslayer(UDP), f"{context}: UDP header is absent")
+            for field in ("sport", "dport", "len", "chksum"):
+                self.assertEqual(
+                    getattr(received[UDP], field),
+                    getattr(sent[UDP], field),
+                    f"{context}: UDP {field} changed",
+                )
+            self.assertEqual(
+                bytes(received[UDP].payload),
+                bytes(sent[UDP].payload),
+                f"{context}: UDP payload changed",
+            )
+            if sent[UDP].chksum != 0:
+                self.assertEqual(
+                    transport_checksum(received[IP]),
+                    0,
+                    f"{context}: UDP checksum is invalid",
+                )
 
     def test_topology_configuration(self):
         port_map = {
@@ -287,49 +378,124 @@ class ForwardingIntegrationTest(unittest.TestCase):
                 f"{config['gateway_ip']} lladdr {config['gateway_mac']} PERMANENT",
             )
 
-    def test_tcp_h1_to_h3(self):
-        token = b"qos-forward-tcp-001"
-        packet = (
-            Ether(src=HOSTS["h1"]["mac"], dst=HOSTS["h1"]["gateway_mac"])
-            / IP(src="10.0.1.1", dst="10.0.3.1", ttl=64, id=0x1101)
-            / TCP(
-                sport=12001,
-                dport=443,
-                seq=0x10203040,
-                ack=0x50607080,
-                flags="PA",
-                window=4096,
-            )
-            / Raw(token)
-        )
-        sent, received = self.assert_forwarded("h1", packet, token, 3)
+    def test_high_tcp_preserves_every_ecn_value(self):
+        for ecn in range(4):
+            with self.subTest(ecn=ecn):
+                token = f"qos-high-ecn-{ecn}".encode()
+                packet = (
+                    Ether(
+                        src=HOSTS["h1"]["mac"],
+                        dst=HOSTS["h1"]["gateway_mac"],
+                    )
+                    / IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.1",
+                        ttl=64,
+                        id=0x1100 + ecn,
+                        tos=(17 << 2) | ecn,
+                    )
+                    / TCP(
+                        sport=12001 + ecn,
+                        dport=443,
+                        seq=0x10203040 + ecn,
+                        ack=0x50607080 + ecn,
+                        flags="PA",
+                        window=4096,
+                    )
+                    / Raw(token)
+                )
+                self.assert_forwarded(
+                    "h1",
+                    packet,
+                    token,
+                    3,
+                    "HIGH",
+                    46,
+                )
 
-        self.assertEqual(received[TCP].sport, sent[TCP].sport)
-        self.assertEqual(received[TCP].dport, sent[TCP].dport)
-        self.assertEqual(received[TCP].seq, sent[TCP].seq)
-        self.assertEqual(received[TCP].ack, sent[TCP].ack)
-        self.assertEqual(int(received[TCP].flags), int(sent[TCP].flags))
-        self.assertEqual(bytes(received[Raw].load), token)
-        self.assertEqual(received[TCP].chksum, sent[TCP].chksum)
-        self.assertEqual(transport_checksum(received[IP]), 0, "TCP checksum is invalid")
-
-    def test_udp_h2_to_h3(self):
-        token = b"qos-forward-udp-002"
+    def test_normal_udp_to_h3(self):
+        token = b"qos-normal-udp-5000"
         packet = (
             Ether(src=HOSTS["h2"]["mac"], dst=HOSTS["h2"]["gateway_mac"])
-            / IP(src="10.0.2.1", dst="10.0.3.1", ttl=61, id=0x2202)
+            / IP(
+                src="10.0.2.1",
+                dst="10.0.3.1",
+                ttl=61,
+                id=0x2202,
+                tos=(37 << 2) | 1,
+            )
             / UDP(sport=22002, dport=5000)
             / Raw(token)
         )
-        sent, received = self.assert_forwarded("h2", packet, token, 3)
+        self.assert_forwarded("h2", packet, token, 3, "NORMAL", 0)
 
-        self.assertEqual(received[UDP].sport, sent[UDP].sport)
-        self.assertEqual(received[UDP].dport, sent[UDP].dport)
-        self.assertEqual(received[UDP].len, sent[UDP].len)
-        self.assertEqual(bytes(received[Raw].load), token)
-        self.assertNotEqual(sent[UDP].chksum, 0)
-        self.assertEqual(received[UDP].chksum, sent[UDP].chksum)
-        self.assertEqual(transport_checksum(received[IP]), 0, "UDP checksum is invalid")
+    def test_scavenger_udp_to_h3(self):
+        token = b"qos-scavenger-udp-5001"
+        packet = (
+            Ether(src=HOSTS["h2"]["mac"], dst=HOSTS["h2"]["gateway_mac"])
+            / IP(
+                src="10.0.2.1",
+                dst="10.0.3.1",
+                ttl=59,
+                id=0x2303,
+                tos=(61 << 2) | 2,
+            )
+            / UDP(sport=23003, dport=5001)
+            / Raw(token)
+        )
+        self.assert_forwarded("h2", packet, token, 3, "SCAVENGER", 8)
+
+    def test_classifier_near_misses_default_to_normal(self):
+        cases = (
+            ("high-ingress", "h2", "10.0.1.200", "10.0.3.1", TCP, 443, 3),
+            ("high-source", "h1", "10.0.2.200", "10.0.3.1", TCP, 443, 3),
+            ("high-destination", "h1", "10.0.1.1", "10.0.2.1", TCP, 443, 2),
+            ("high-protocol", "h1", "10.0.1.1", "10.0.3.1", UDP, 443, 3),
+            ("high-port", "h1", "10.0.1.1", "10.0.3.1", TCP, 444, 3),
+            ("scavenger-ingress", "h1", "10.0.2.200", "10.0.3.1", UDP, 5001, 3),
+            ("scavenger-source", "h2", "10.0.1.200", "10.0.3.1", UDP, 5001, 3),
+            ("scavenger-destination", "h2", "10.0.2.1", "10.0.1.1", UDP, 5001, 1),
+            ("scavenger-protocol", "h2", "10.0.2.1", "10.0.3.1", TCP, 5001, 3),
+        )
+        for index, (
+            name,
+            source,
+            ip_source,
+            ip_destination,
+            layer,
+            port,
+            egress,
+        ) in enumerate(cases):
+            with self.subTest(name=name):
+                token = f"qos-near-miss-{index}".encode()
+                transport = layer(sport=30000 + index, dport=port)
+                if layer is TCP:
+                    transport.seq = 0x60000000 + index
+                    transport.ack = 0x70000000 + index
+                    transport.flags = "PA"
+                packet = (
+                    Ether(
+                        src=HOSTS[source]["mac"],
+                        dst=HOSTS[source]["gateway_mac"],
+                    )
+                    / IP(
+                        src=ip_source,
+                        dst=ip_destination,
+                        ttl=48 + index,
+                        id=0x4000 + index,
+                        tos=(([5, 17, 37, 61][index % 4]) << 2) | (index % 4),
+                    )
+                    / transport
+                    / Raw(token)
+                )
+                self.assert_forwarded(
+                    source,
+                    packet,
+                    token,
+                    egress,
+                    "NORMAL (classifier miss)",
+                    0,
+                )
 
     def test_reverse_h3_to_h1(self):
         token = b"qos-forward-rev-003"
@@ -339,14 +505,7 @@ class ForwardingIntegrationTest(unittest.TestCase):
             / UDP(sport=33003, dport=7000)
             / Raw(token)
         )
-        sent, received = self.assert_forwarded("h3", packet, token, 1)
-        self.assertEqual(received[UDP].sport, sent[UDP].sport)
-        self.assertEqual(received[UDP].dport, sent[UDP].dport)
-        self.assertEqual(received[UDP].len, sent[UDP].len)
-        self.assertEqual(bytes(received[Raw].load), token)
-        self.assertNotEqual(sent[UDP].chksum, 0)
-        self.assertEqual(received[UDP].chksum, sent[UDP].chksum)
-        self.assertEqual(transport_checksum(received[IP]), 0, "UDP checksum is invalid")
+        self.assert_forwarded("h3", packet, token, 1, "NORMAL (classifier miss)", 0)
 
     def test_reverse_h3_to_h2(self):
         token = b"qos-forward-rev-005"
@@ -356,14 +515,7 @@ class ForwardingIntegrationTest(unittest.TestCase):
             / UDP(sport=35005, dport=7100)
             / Raw(token)
         )
-        sent, received = self.assert_forwarded("h3", packet, token, 2)
-        self.assertEqual(received[UDP].sport, sent[UDP].sport)
-        self.assertEqual(received[UDP].dport, sent[UDP].dport)
-        self.assertEqual(received[UDP].len, sent[UDP].len)
-        self.assertEqual(bytes(received[Raw].load), token)
-        self.assertNotEqual(sent[UDP].chksum, 0)
-        self.assertEqual(received[UDP].chksum, sent[UDP].chksum)
-        self.assertEqual(transport_checksum(received[IP]), 0, "UDP checksum is invalid")
+        self.assert_forwarded("h3", packet, token, 2, "NORMAL (classifier miss)", 0)
 
     def test_route_miss_drops(self):
         token = b"qos-route-miss-004"

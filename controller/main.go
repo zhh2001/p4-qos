@@ -16,12 +16,21 @@ import (
 	p4v1 "github.com/p4lang/p4runtime/go/p4/v1"
 	"github.com/zhh2001/p4runtime-go-controller/client"
 	"github.com/zhh2001/p4runtime-go-controller/codec"
+	"github.com/zhh2001/p4runtime-go-controller/meter"
 	"github.com/zhh2001/p4runtime-go-controller/pipeline"
 	"github.com/zhh2001/p4runtime-go-controller/tableentry"
 	"google.golang.org/protobuf/proto"
 )
 
-const routeTableName = "ipv4_lpm"
+const (
+	routeTableName      = "ipv4_lpm"
+	classifierTableName = "qos_classifier"
+	classMeterName      = "class_meter"
+
+	classHigh      = 1
+	classNormal    = 2
+	classScavenger = 3
+)
 
 type options struct {
 	address      string
@@ -37,6 +46,23 @@ type route struct {
 	port   uint64
 	srcMAC string
 	dstMAC string
+}
+
+type classifierRule struct {
+	name                 string
+	ingressPort          uint64
+	sourcePrefix         string
+	destinationPrefix    string
+	protocol             uint64
+	destinationPort      uint64
+	matchDestinationPort bool
+	priority             int32
+	classID              uint64
+}
+
+type classMeterConfig struct {
+	classID int64
+	config  meter.Config
 }
 
 var routes = []route{
@@ -57,6 +83,55 @@ var routes = []route{
 		port:   3,
 		srcMAC: "02:00:00:00:03:fe",
 		dstMAC: "02:00:00:00:03:01",
+	},
+}
+
+var classifierRules = []classifierRule{
+	{
+		name:                 "high_https",
+		ingressPort:          1,
+		sourcePrefix:         "10.0.1.0",
+		destinationPrefix:    "10.0.3.0",
+		protocol:             6,
+		destinationPort:      443,
+		matchDestinationPort: true,
+		priority:             30,
+		classID:              classHigh,
+	},
+	{
+		name:                 "normal_udp_5000",
+		ingressPort:          2,
+		sourcePrefix:         "10.0.2.0",
+		destinationPrefix:    "10.0.3.0",
+		protocol:             17,
+		destinationPort:      5000,
+		matchDestinationPort: true,
+		priority:             30,
+		classID:              classNormal,
+	},
+	{
+		name:              "scavenger_udp",
+		ingressPort:       2,
+		sourcePrefix:      "10.0.2.0",
+		destinationPrefix: "10.0.3.0",
+		protocol:          17,
+		priority:          10,
+		classID:           classScavenger,
+	},
+}
+
+var classMeters = []classMeterConfig{
+	{
+		classID: classHigh,
+		config:  meter.Config{CIR: 10000, CBurst: 100, PIR: 20000, PBurst: 200},
+	},
+	{
+		classID: classNormal,
+		config:  meter.Config{CIR: 10000, CBurst: 100, PIR: 20000, PBurst: 200},
+	},
+	{
+		classID: classScavenger,
+		config:  meter.Config{CIR: 10000, CBurst: 100, PIR: 20000, PBurst: 200},
 	},
 }
 
@@ -110,6 +185,14 @@ func run(ctx context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
+	wantClassifiers, err := buildClassifierEntries(want)
+	if err != nil {
+		return err
+	}
+	wantClassifierDefault, err := buildClassifierDefault(want)
+	if err != nil {
+		return err
+	}
 
 	controller, err := client.Dial(
 		ctx,
@@ -123,6 +206,10 @@ func run(ctx context.Context, opts options) error {
 		return fmt.Errorf("connect to %s: %w", opts.address, err)
 	}
 	defer controller.Close()
+	meterReader, err := meter.NewReader(controller, want)
+	if err != nil {
+		return fmt.Errorf("initialize meter access: %w", err)
+	}
 
 	if err := controller.BecomePrimary(ctx); err != nil {
 		return fmt.Errorf("become primary: %w", err)
@@ -132,19 +219,45 @@ func run(ctx context.Context, opts options) error {
 			return fmt.Errorf("install pipeline: %w", err)
 		}
 
-		updates := make([]*p4v1.Update, 0, len(wantRoutes))
+		updates := make([]*p4v1.Update, 0, len(wantRoutes)+len(wantClassifiers))
 		for _, entry := range wantRoutes {
 			updates = append(updates, client.TableEntryUpdate(client.UpdateInsert, entry))
 		}
+		for _, entry := range wantClassifiers {
+			updates = append(updates, client.TableEntryUpdate(client.UpdateInsert, entry))
+		}
 		if err := controller.Write(ctx, client.WriteOptions{}, updates...); err != nil {
-			return fmt.Errorf("install IPv4 routes: %w", err)
+			return fmt.Errorf("install table entries: %w", err)
+		}
+		for _, configured := range classMeters {
+			if err := meterReader.Write(
+				ctx,
+				classMeterName,
+				configured.classID,
+				configured.config,
+			); err != nil {
+				return fmt.Errorf("configure class %d meter: %w", configured.classID, err)
+			}
 		}
 	}
 
-	if err := verifyState(ctx, controller, want, wantRoutes); err != nil {
+	if err := verifyState(
+		ctx,
+		controller,
+		meterReader,
+		want,
+		wantRoutes,
+		wantClassifiers,
+		wantClassifierDefault,
+	); err != nil {
 		return err
 	}
-	fmt.Printf("verified pipeline and %d IPv4 routes\n", len(wantRoutes))
+	fmt.Printf(
+		"verified pipeline, %d IPv4 routes, %d QoS classifiers, and %d class meters\n",
+		len(wantRoutes),
+		len(wantClassifiers),
+		len(classMeters),
+	)
 	return nil
 }
 
@@ -201,11 +314,116 @@ func buildRouteEntries(p *pipeline.Pipeline) ([]*p4v1.TableEntry, error) {
 	return entries, nil
 }
 
+func buildClassifierEntries(p *pipeline.Pipeline) ([]*p4v1.TableEntry, error) {
+	ingressMask, err := codec.EncodeUint(0x1ff, 9)
+	if err != nil {
+		return nil, fmt.Errorf("encode ingress-port mask: %w", err)
+	}
+	prefixMask, err := codec.TernaryMask(24, 32)
+	if err != nil {
+		return nil, fmt.Errorf("encode IPv4 prefix mask: %w", err)
+	}
+	protocolMask, err := codec.EncodeUint(0xff, 8)
+	if err != nil {
+		return nil, fmt.Errorf("encode protocol mask: %w", err)
+	}
+	destinationPortMask, err := codec.EncodeUint(0xffff, 16)
+	if err != nil {
+		return nil, fmt.Errorf("encode destination-port mask: %w", err)
+	}
+
+	entries := make([]*p4v1.TableEntry, 0, len(classifierRules))
+	for _, configured := range classifierRules {
+		ingressPort, err := codec.EncodeUint(configured.ingressPort, 9)
+		if err != nil {
+			return nil, fmt.Errorf("%s ingress port: %w", configured.name, err)
+		}
+		sourcePrefix, err := codec.IPv4(configured.sourcePrefix)
+		if err != nil {
+			return nil, fmt.Errorf("%s source prefix: %w", configured.name, err)
+		}
+		destinationPrefix, err := codec.IPv4(configured.destinationPrefix)
+		if err != nil {
+			return nil, fmt.Errorf("%s destination prefix: %w", configured.name, err)
+		}
+		protocol, err := codec.EncodeUint(configured.protocol, 8)
+		if err != nil {
+			return nil, fmt.Errorf("%s protocol: %w", configured.name, err)
+		}
+		classID, err := codec.EncodeUint(configured.classID, 8)
+		if err != nil {
+			return nil, fmt.Errorf("%s class ID: %w", configured.name, err)
+		}
+
+		builder := tableentry.NewBuilder(p, classifierTableName).
+			Match(
+				"standard_metadata.ingress_port",
+				tableentry.Ternary(ingressPort, ingressMask),
+			).
+			Match(
+				"hdr.ipv4.srcAddr",
+				tableentry.Ternary(sourcePrefix, prefixMask),
+			).
+			Match(
+				"hdr.ipv4.dstAddr",
+				tableentry.Ternary(destinationPrefix, prefixMask),
+			).
+			Match(
+				"hdr.ipv4.protocol",
+				tableentry.Ternary(protocol, protocolMask),
+			)
+		if configured.matchDestinationPort {
+			destinationPort, err := codec.EncodeUint(configured.destinationPort, 16)
+			if err != nil {
+				return nil, fmt.Errorf("%s destination port: %w", configured.name, err)
+			}
+			builder.Match(
+				"meta.l4DstPort",
+				tableentry.Ternary(destinationPort, destinationPortMask),
+			)
+		}
+
+		entry, err := builder.
+			Action(
+				"set_qos_class",
+				tableentry.Param("class_id", classID),
+			).
+			Priority(configured.priority).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("build classifier %s: %w", configured.name, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func buildClassifierDefault(p *pipeline.Pipeline) (*p4v1.TableEntry, error) {
+	classID, err := codec.EncodeUint(classNormal, 8)
+	if err != nil {
+		return nil, fmt.Errorf("encode default class ID: %w", err)
+	}
+	entry, err := tableentry.NewBuilder(p, classifierTableName).
+		AsDefault().
+		Action(
+			"set_qos_class",
+			tableentry.Param("class_id", classID),
+		).
+		Build()
+	if err != nil {
+		return nil, fmt.Errorf("build classifier default: %w", err)
+	}
+	return entry, nil
+}
+
 func verifyState(
 	ctx context.Context,
 	controller *client.Client,
+	meterReader *meter.Reader,
 	want *pipeline.Pipeline,
 	wantRoutes []*p4v1.TableEntry,
+	wantClassifiers []*p4v1.TableEntry,
+	wantClassifierDefault *p4v1.TableEntry,
 ) error {
 	got, err := controller.GetPipeline(ctx)
 	if err != nil {
@@ -218,16 +436,131 @@ func verifyState(
 		return errors.New("pipeline device configuration readback does not match")
 	}
 
-	table, ok := want.Table(routeTableName)
-	if !ok {
-		return fmt.Errorf("table %q not present in P4Info", routeTableName)
-	}
-	gotRoutes, err := controller.ReadTableEntries(ctx, table.ID)
-	if err != nil {
-		return fmt.Errorf("read IPv4 routes: %w", err)
-	}
-	if err := compareTableEntries(wantRoutes, gotRoutes); err != nil {
+	if err := verifyTableEntries(
+		ctx,
+		controller,
+		want,
+		routeTableName,
+		wantRoutes,
+	); err != nil {
 		return fmt.Errorf("verify IPv4 routes: %w", err)
+	}
+	if err := verifyTableEntries(
+		ctx,
+		controller,
+		want,
+		classifierTableName,
+		wantClassifiers,
+	); err != nil {
+		return fmt.Errorf("verify QoS classifiers: %w", err)
+	}
+	if err := verifyDefaultTableEntry(
+		ctx,
+		controller,
+		want,
+		classifierTableName,
+		wantClassifierDefault,
+	); err != nil {
+		return fmt.Errorf("verify classifier default: %w", err)
+	}
+	if err := verifyClassMeters(ctx, meterReader, want); err != nil {
+		return fmt.Errorf("verify class meters: %w", err)
+	}
+	return nil
+}
+
+func verifyDefaultTableEntry(
+	ctx context.Context,
+	controller *client.Client,
+	p *pipeline.Pipeline,
+	tableName string,
+	want *p4v1.TableEntry,
+) error {
+	table, ok := p.Table(tableName)
+	if !ok {
+		return fmt.Errorf("table %q not present in P4Info", tableName)
+	}
+	entities, err := controller.Read(ctx, &p4v1.Entity{
+		Entity: &p4v1.Entity_TableEntry{TableEntry: &p4v1.TableEntry{
+			TableId:         table.ID,
+			IsDefaultAction: true,
+		}},
+	})
+	if err != nil {
+		return fmt.Errorf("read table %q default: %w", tableName, err)
+	}
+	if len(entities) != 1 {
+		return fmt.Errorf(
+			"table %q default read returned %d entities, want 1",
+			tableName,
+			len(entities),
+		)
+	}
+	if entities[0].GetTableEntry() == nil {
+		return fmt.Errorf("table %q default read returned a non-table entity", tableName)
+	}
+	return compareTableEntries(
+		[]*p4v1.TableEntry{want},
+		[]*p4v1.TableEntry{entities[0].GetTableEntry()},
+	)
+}
+
+func verifyTableEntries(
+	ctx context.Context,
+	controller *client.Client,
+	p *pipeline.Pipeline,
+	tableName string,
+	want []*p4v1.TableEntry,
+) error {
+	table, ok := p.Table(tableName)
+	if !ok {
+		return fmt.Errorf("table %q not present in P4Info", tableName)
+	}
+	got, err := controller.ReadTableEntries(ctx, table.ID)
+	if err != nil {
+		return fmt.Errorf("read table %q: %w", tableName, err)
+	}
+	if err := compareTableEntries(want, got); err != nil {
+		return err
+	}
+	return nil
+}
+
+func verifyClassMeters(
+	ctx context.Context,
+	meterReader *meter.Reader,
+	p *pipeline.Pipeline,
+) error {
+	definition, ok := p.Meter(classMeterName)
+	if !ok {
+		return fmt.Errorf("meter %q not present in P4Info", classMeterName)
+	}
+	for _, configured := range classMeters {
+		entries, err := meterReader.Read(ctx, classMeterName, configured.classID)
+		if err != nil {
+			return fmt.Errorf("read class %d meter: %w", configured.classID, err)
+		}
+		if len(entries) != 1 {
+			return fmt.Errorf(
+				"class %d meter read returned %d entries, want 1",
+				configured.classID,
+				len(entries),
+			)
+		}
+		entry := entries[0]
+		if entry.GetMeterId() != definition.ID ||
+			entry.GetIndex().GetIndex() != configured.classID {
+			return fmt.Errorf("class %d meter identity does not match", configured.classID)
+		}
+		wantConfig := &p4v1.MeterConfig{
+			Cir:    configured.config.CIR,
+			Cburst: configured.config.CBurst,
+			Pir:    configured.config.PIR,
+			Pburst: configured.config.PBurst,
+		}
+		if !proto.Equal(entry.GetConfig(), wantConfig) {
+			return fmt.Errorf("class %d meter configuration does not match", configured.classID)
+		}
 	}
 	return nil
 }
